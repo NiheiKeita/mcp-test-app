@@ -1,15 +1,22 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  Tool,
+} from "@modelcontextprotocol/sdk/types.js";
 import dotenv from "dotenv";
 import fs from "node:fs/promises";
+import http from "node:http";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { URL } from "node:url";
 import YAML from "yaml";
 
 dotenv.config();
 
 const baseUrl = process.env.MCP_API_BASE_URL ?? "http://localhost:8081";
+const httpPort = Number(process.env.MCP_HTTP_PORT ?? "5175");
 
 const server = new Server(
   {
@@ -160,8 +167,8 @@ function defaultTvName(state: WizardState): string {
   return `${maker} ${inch}`.trim();
 }
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  const tools = [
+function getToolDefinitions(): Tool[] {
+  return [
     {
       name: "api.list_tools_from_openapi",
       description: "Read an OpenAPI file and list available endpoints.",
@@ -253,320 +260,381 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
     },
   ];
+}
 
-  return { tools };
+async function handleTool(name: string, args: Record<string, unknown> | undefined) {
+  switch (name) {
+    case "api.list_tools_from_openapi": {
+      const openapiPath = String(args?.openapiPath ?? "");
+      const doc = await readOpenApi(openapiPath);
+      const tools = [] as Array<{ name: string; description: string; params: unknown }>;
+
+      for (const [apiPath, methods] of Object.entries(doc.paths ?? {})) {
+        for (const method of ["get", "post", "put", "patch", "delete"]) {
+          const operation = methods?.[method];
+          if (!operation) {
+            continue;
+          }
+          const parameters = [...(methods?.parameters ?? []), ...(operation.parameters ?? [])];
+          const requestBody = operation.requestBody ?? null;
+          tools.push({
+            name: `${method.toUpperCase()} ${apiPath}`,
+            description: operation.summary ?? operation.description ?? "",
+            params: {
+              parameters,
+              requestBody,
+            },
+          });
+        }
+      }
+
+      return { tools };
+    }
+    case "api.call": {
+      const method = String(args?.method ?? "GET").toUpperCase();
+      const apiPath = String(args?.path ?? "");
+      const query = (args?.query as Record<string, unknown>) ?? undefined;
+      const body = args?.body ?? undefined;
+
+      return await callApi(method, apiPath, query, body);
+    }
+    case "tvWizard.start": {
+      const id = randomUUID();
+      wizardStore.set(id, {
+        id,
+        phase: "maker",
+        data: {},
+        selectedOptions: [],
+      });
+      return { wizard_id: id };
+    }
+    case "tvWizard.next": {
+      const wizardId = String(args?.wizard_id ?? "");
+      const state = getWizard(wizardId);
+
+      switch (state.phase) {
+        case "maker":
+          return {
+            question: "Select maker",
+            field: "maker",
+            choices: MAKERS,
+            input_type: "select",
+          };
+        case "inch":
+          return {
+            question: "Select inch size",
+            field: "inch",
+            choices: INCHES,
+            input_type: "select",
+          };
+        case "resolution":
+          return {
+            question: "Select resolution",
+            field: "resolution",
+            choices: RESOLUTIONS,
+            input_type: "select",
+          };
+        case "panel":
+          return {
+            question: "Select panel type (8K is best with MiniLED)",
+            field: "panel",
+            choices: PANELS,
+            input_type: "select",
+          };
+        case "hdmi_ports":
+          return {
+            question: "Select HDMI ports",
+            field: "hdmi_ports",
+            choices: HDMI_PORTS,
+            input_type: "select",
+          };
+        case "has_hdr":
+          return {
+            question: "HDR support?",
+            field: "has_hdr",
+            choices: ["yes", "no"],
+            input_type: "boolean",
+          };
+        case "has_wifi":
+          return {
+            question: "Wi-Fi support?",
+            field: "has_wifi",
+            choices: ["yes", "no"],
+            input_type: "boolean",
+          };
+        case "option_category":
+          return {
+            question: "Select option category (or finish)",
+            field: "option_category",
+            choices: [...OPTION_CATEGORIES, "FINISH"],
+            input_type: "select",
+          };
+        case "option_choice":
+          return {
+            question: `Select option in ${state.optionCategory}`,
+            field: "option_id",
+            choices: (state.optionChoices ?? []).map((option) => ({
+              id: option.id,
+              label: `${option.label} (${option.price_yen} yen)`,
+            })),
+            input_type: "select",
+          };
+        case "option_quantity":
+          return {
+            question: "Select quantity",
+            field: "option_quantity",
+            choices: [1, 2, 3, 4, 5],
+            input_type: "select",
+          };
+        case "option_continue":
+          return {
+            question: "Add more options?",
+            field: "option_action",
+            choices: ["SAME_CATEGORY", "ANOTHER_CATEGORY", "FINISH"],
+            input_type: "select",
+          };
+        case "confirm":
+          return {
+            question: "Ready to confirm",
+            field: "confirm",
+            choices: ["confirm"],
+            input_type: "confirm",
+          };
+        default:
+          return { message: "Wizard complete" };
+      }
+    }
+    case "tvWizard.submit": {
+      const wizardId = String(args?.wizard_id ?? "");
+      const field = String(args?.field ?? "");
+      const value = args?.value;
+      const state = getWizard(wizardId);
+
+      switch (field) {
+        case "maker":
+          state.data.maker = String(value);
+          state.phase = "inch";
+          break;
+        case "inch":
+          state.data.inch = Number(value);
+          state.phase = "resolution";
+          break;
+        case "resolution":
+          state.data.resolution = String(value);
+          state.phase = "panel";
+          break;
+        case "panel":
+          state.data.panel = String(value);
+          state.phase = "hdmi_ports";
+          break;
+        case "hdmi_ports":
+          state.data.hdmi_ports = Number(value);
+          state.phase = "has_hdr";
+          break;
+        case "has_hdr":
+          state.data.has_hdr = String(value).toLowerCase() === "yes" || value === true;
+          state.phase = "has_wifi";
+          break;
+        case "has_wifi":
+          state.data.has_wifi = String(value).toLowerCase() === "yes" || value === true;
+          state.phase = "option_category";
+          break;
+        case "option_category": {
+          const category = String(value);
+          if (category === "FINISH") {
+            state.phase = "confirm";
+            break;
+          }
+          state.optionCategory = category;
+          const result = await callApi("GET", "/api/tv-options", { category });
+          const options = Array.isArray(result.data) ? result.data : [];
+          state.optionChoices = options.map((item: any) => ({
+            id: Number(item.id),
+            category: String(item.category),
+            code: String(item.code),
+            label: String(item.label),
+            price_yen: Number(item.price_yen),
+          }));
+          state.phase = "option_choice";
+          break;
+        }
+        case "option_id": {
+          const optionId = Number(value);
+          const choice = state.optionChoices?.find((option) => option.id === optionId);
+          if (!choice) {
+            throw new Error("Option not found in current category");
+          }
+          state.optionChoices = [choice];
+          state.phase = "option_quantity";
+          break;
+        }
+        case "option_quantity": {
+          const choice = state.optionChoices?.[0];
+          if (!choice) {
+            throw new Error("No option selected");
+          }
+          const quantity = Number(value);
+          state.selectedOptions.push({
+            tv_option_id: choice.id,
+            quantity,
+            price_yen: choice.price_yen,
+            label: choice.label,
+          });
+          state.optionChoices = undefined;
+          state.phase = "option_continue";
+          break;
+        }
+        case "option_action": {
+          const action = String(value);
+          if (action === "SAME_CATEGORY") {
+            if (state.optionCategory) {
+              const result = await callApi("GET", "/api/tv-options", {
+                category: state.optionCategory,
+              });
+              const options = Array.isArray(result.data) ? result.data : [];
+              state.optionChoices = options.map((item: any) => ({
+                id: Number(item.id),
+                category: String(item.category),
+                code: String(item.code),
+                label: String(item.label),
+                price_yen: Number(item.price_yen),
+              }));
+            }
+            state.phase = "option_choice";
+          } else if (action === "ANOTHER_CATEGORY") {
+            state.phase = "option_category";
+          } else {
+            state.phase = "confirm";
+          }
+          break;
+        }
+        default:
+          throw new Error(`Unknown field: ${field}`);
+      }
+
+      wizardStore.set(wizardId, state);
+      return { ok: true, state_summary: buildWizardSummary(state) };
+    }
+    case "tvWizard.confirm": {
+      const wizardId = String(args?.wizard_id ?? "");
+      const state = getWizard(wizardId);
+      const total = state.selectedOptions.reduce(
+        (sum, option) => sum + option.price_yen * option.quantity,
+        0
+      );
+      return {
+        payload_preview: {
+          ...state.data,
+          name: state.data.name ?? defaultTvName(state),
+          selected_options: state.selectedOptions.map((option) => ({
+            tv_option_id: option.tv_option_id,
+            quantity: option.quantity,
+          })),
+        },
+        estimated_total_price_yen: total,
+      };
+    }
+    case "tvWizard.create": {
+      const wizardId = String(args?.wizard_id ?? "");
+      const state = getWizard(wizardId);
+      const payload = {
+        name: state.data.name ?? defaultTvName(state),
+        maker: state.data.maker,
+        inch: state.data.inch,
+        resolution: state.data.resolution,
+        panel: state.data.panel,
+        hdmi_ports: state.data.hdmi_ports,
+        has_hdr: state.data.has_hdr,
+        has_wifi: state.data.has_wifi,
+        selected_options: state.selectedOptions.map((option) => ({
+          tv_option_id: option.tv_option_id,
+          quantity: option.quantity,
+        })),
+      };
+
+      return await callApi("POST", "/api/tvs", undefined, payload);
+    }
+    case "tvWizard.reset": {
+      const wizardId = String(args?.wizard_id ?? "");
+      wizardStore.delete(wizardId);
+      return { ok: true };
+    }
+    default:
+      throw new Error(`Unknown tool: ${name}`);
+  }
+}
+
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  return { tools: getToolDefinitions() };
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
-    switch (name) {
-      case "api.list_tools_from_openapi": {
-        const openapiPath = String(args?.openapiPath ?? "");
-        const doc = await readOpenApi(openapiPath);
-        const tools = [] as Array<{ name: string; description: string; params: unknown }>;
-
-        for (const [apiPath, methods] of Object.entries(doc.paths ?? {})) {
-          for (const method of ["get", "post", "put", "patch", "delete"]) {
-            const operation = methods?.[method];
-            if (!operation) {
-              continue;
-            }
-            const parameters = [...(methods?.parameters ?? []), ...(operation.parameters ?? [])];
-            const requestBody = operation.requestBody ?? null;
-            tools.push({
-              name: `${method.toUpperCase()} ${apiPath}`,
-              description: operation.summary ?? operation.description ?? "",
-              params: {
-                parameters,
-                requestBody,
-              },
-            });
-          }
-        }
-
-        return jsonResponse({ tools });
-      }
-      case "api.call": {
-        const method = String(args?.method ?? "GET").toUpperCase();
-        const apiPath = String(args?.path ?? "");
-        const query = (args?.query as Record<string, unknown>) ?? undefined;
-        const body = args?.body ?? undefined;
-
-        const result = await callApi(method, apiPath, query, body);
-        return jsonResponse(result);
-      }
-      case "tvWizard.start": {
-        const id = randomUUID();
-        wizardStore.set(id, {
-          id,
-          phase: "maker",
-          data: {},
-          selectedOptions: [],
-        });
-        return jsonResponse({ wizard_id: id });
-      }
-      case "tvWizard.next": {
-        const wizardId = String(args?.wizard_id ?? "");
-        const state = getWizard(wizardId);
-
-        switch (state.phase) {
-          case "maker":
-            return jsonResponse({
-              question: "Select maker",
-              field: "maker",
-              choices: MAKERS,
-              input_type: "select",
-            });
-          case "inch":
-            return jsonResponse({
-              question: "Select inch size",
-              field: "inch",
-              choices: INCHES,
-              input_type: "select",
-            });
-          case "resolution":
-            return jsonResponse({
-              question: "Select resolution",
-              field: "resolution",
-              choices: RESOLUTIONS,
-              input_type: "select",
-            });
-          case "panel":
-            return jsonResponse({
-              question: "Select panel type (8K is best with MiniLED)",
-              field: "panel",
-              choices: PANELS,
-              input_type: "select",
-            });
-          case "hdmi_ports":
-            return jsonResponse({
-              question: "Select HDMI ports",
-              field: "hdmi_ports",
-              choices: HDMI_PORTS,
-              input_type: "select",
-            });
-          case "has_hdr":
-            return jsonResponse({
-              question: "HDR support?",
-              field: "has_hdr",
-              choices: ["yes", "no"],
-              input_type: "boolean",
-            });
-          case "has_wifi":
-            return jsonResponse({
-              question: "Wi-Fi support?",
-              field: "has_wifi",
-              choices: ["yes", "no"],
-              input_type: "boolean",
-            });
-          case "option_category":
-            return jsonResponse({
-              question: "Select option category (or finish)",
-              field: "option_category",
-              choices: [...OPTION_CATEGORIES, "FINISH"],
-              input_type: "select",
-            });
-          case "option_choice":
-            return jsonResponse({
-              question: `Select option in ${state.optionCategory}`,
-              field: "option_id",
-              choices: (state.optionChoices ?? []).map((option) => ({
-                id: option.id,
-                label: `${option.label} (${option.price_yen} yen)`,
-              })),
-              input_type: "select",
-            });
-          case "option_quantity":
-            return jsonResponse({
-              question: "Select quantity",
-              field: "option_quantity",
-              choices: [1, 2, 3, 4, 5],
-              input_type: "select",
-            });
-          case "option_continue":
-            return jsonResponse({
-              question: "Add more options?",
-              field: "option_action",
-              choices: ["SAME_CATEGORY", "ANOTHER_CATEGORY", "FINISH"],
-              input_type: "select",
-            });
-          case "confirm":
-            return jsonResponse({
-              question: "Ready to confirm",
-              field: "confirm",
-              choices: ["confirm"],
-              input_type: "confirm",
-            });
-          default:
-            return jsonResponse({ message: "Wizard complete" });
-        }
-      }
-      case "tvWizard.submit": {
-        const wizardId = String(args?.wizard_id ?? "");
-        const field = String(args?.field ?? "");
-        const value = args?.value;
-        const state = getWizard(wizardId);
-
-        switch (field) {
-          case "maker":
-            state.data.maker = String(value);
-            state.phase = "inch";
-            break;
-          case "inch":
-            state.data.inch = Number(value);
-            state.phase = "resolution";
-            break;
-          case "resolution":
-            state.data.resolution = String(value);
-            state.phase = "panel";
-            break;
-          case "panel":
-            state.data.panel = String(value);
-            state.phase = "hdmi_ports";
-            break;
-          case "hdmi_ports":
-            state.data.hdmi_ports = Number(value);
-            state.phase = "has_hdr";
-            break;
-          case "has_hdr":
-            state.data.has_hdr = String(value).toLowerCase() === "yes" || value === true;
-            state.phase = "has_wifi";
-            break;
-          case "has_wifi":
-            state.data.has_wifi = String(value).toLowerCase() === "yes" || value === true;
-            state.phase = "option_category";
-            break;
-          case "option_category": {
-            const category = String(value);
-            if (category === "FINISH") {
-              state.phase = "confirm";
-              break;
-            }
-            state.optionCategory = category;
-            const result = await callApi("GET", "/api/tv-options", { category });
-            const options = Array.isArray(result.data) ? result.data : [];
-            state.optionChoices = options.map((item: any) => ({
-              id: Number(item.id),
-              category: String(item.category),
-              code: String(item.code),
-              label: String(item.label),
-              price_yen: Number(item.price_yen),
-            }));
-            state.phase = "option_choice";
-            break;
-          }
-          case "option_id": {
-            const optionId = Number(value);
-            const choice = state.optionChoices?.find((option) => option.id === optionId);
-            if (!choice) {
-              throw new Error("Option not found in current category");
-            }
-            state.optionChoices = [choice];
-            state.phase = "option_quantity";
-            break;
-          }
-          case "option_quantity": {
-            const choice = state.optionChoices?.[0];
-            if (!choice) {
-              throw new Error("No option selected");
-            }
-            const quantity = Number(value);
-            state.selectedOptions.push({
-              tv_option_id: choice.id,
-              quantity,
-              price_yen: choice.price_yen,
-              label: choice.label,
-            });
-            state.optionChoices = undefined;
-            state.phase = "option_continue";
-            break;
-          }
-          case "option_action": {
-            const action = String(value);
-            if (action === "SAME_CATEGORY") {
-              if (state.optionCategory) {
-                const result = await callApi("GET", "/api/tv-options", {
-                  category: state.optionCategory,
-                });
-                const options = Array.isArray(result.data) ? result.data : [];
-                state.optionChoices = options.map((item: any) => ({
-                  id: Number(item.id),
-                  category: String(item.category),
-                  code: String(item.code),
-                  label: String(item.label),
-                  price_yen: Number(item.price_yen),
-                }));
-              }
-              state.phase = "option_choice";
-            } else if (action === "ANOTHER_CATEGORY") {
-              state.phase = "option_category";
-            } else {
-              state.phase = "confirm";
-            }
-            break;
-          }
-          default:
-            throw new Error(`Unknown field: ${field}`);
-        }
-
-        wizardStore.set(wizardId, state);
-        return jsonResponse({ ok: true, state_summary: buildWizardSummary(state) });
-      }
-      case "tvWizard.confirm": {
-        const wizardId = String(args?.wizard_id ?? "");
-        const state = getWizard(wizardId);
-        const total = state.selectedOptions.reduce(
-          (sum, option) => sum + option.price_yen * option.quantity,
-          0
-        );
-        return jsonResponse({
-          payload_preview: {
-            ...state.data,
-            name: state.data.name ?? defaultTvName(state),
-            selected_options: state.selectedOptions.map((option) => ({
-              tv_option_id: option.tv_option_id,
-              quantity: option.quantity,
-            })),
-          },
-          estimated_total_price_yen: total,
-        });
-      }
-      case "tvWizard.create": {
-        const wizardId = String(args?.wizard_id ?? "");
-        const state = getWizard(wizardId);
-        const payload = {
-          name: state.data.name ?? defaultTvName(state),
-          maker: state.data.maker,
-          inch: state.data.inch,
-          resolution: state.data.resolution,
-          panel: state.data.panel,
-          hdmi_ports: state.data.hdmi_ports,
-          has_hdr: state.data.has_hdr,
-          has_wifi: state.data.has_wifi,
-          selected_options: state.selectedOptions.map((option) => ({
-            tv_option_id: option.tv_option_id,
-            quantity: option.quantity,
-          })),
-        };
-
-        const result = await callApi("POST", "/api/tvs", undefined, payload);
-        return jsonResponse(result);
-      }
-      case "tvWizard.reset": {
-        const wizardId = String(args?.wizard_id ?? "");
-        wizardStore.delete(wizardId);
-        return jsonResponse({ ok: true });
-      }
-      default:
-        throw new Error(`Unknown tool: ${name}`);
-    }
+    const result = await handleTool(name, args ?? undefined);
+    return jsonResponse(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return jsonResponse({ error: message });
   }
 });
+
+const httpServer = http.createServer(async (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+
+  if (req.method === "GET" && url.pathname === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/tools/list") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ tools: getToolDefinitions() }));
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/tools/call") {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", async () => {
+      try {
+        const payload = body ? (JSON.parse(body) as { name: string; arguments?: Record<string, unknown> }) : null;
+        if (!payload?.name) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing tool name" }));
+          return;
+        }
+        const result = await handleTool(payload.name, payload.arguments ?? undefined);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: message }));
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "Not found" }));
+});
+
+httpServer.listen(httpPort);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

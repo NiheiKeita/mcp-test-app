@@ -36,6 +36,21 @@ npm run dev
 ```
 
 - `mcp/.env` の `MCP_API_BASE_URL` でLaravel APIのURLを指定できます。
+- MCP HTTP Bridge は `http://localhost:5175`（`MCP_HTTP_PORT`）で起動します。
+
+## WebチャットUI
+
+Inertia React のチャットUIは `http://localhost:8081/mcp-chat` です。
+
+```bash
+cd src
+npm install
+npm run dev
+```
+
+- `src/.env` に `OPENAI_API_KEY` を設定してください。
+- MCP HTTP Bridge のURLは `MCP_HTTP_URL`（Laravel側）で変更できます。
+- フロントから別ホストに投げる場合は `VITE_MCP_CHAT_URL` を `src/.env` に設定します（未設定なら同一オリジン）。
 
 ## 動作確認（API）
 

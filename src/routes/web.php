@@ -8,6 +8,7 @@ use App\Http\Controllers\Admin\ImageController;
 use App\Http\Controllers\Admin\UserController;
 use App\Http\Controllers\Web\LoginController;
 use App\Http\Controllers\Web\PasswordController;
+use App\Http\Controllers\Web\McpChatController;
 use App\Http\Middleware\VerifyCsrfToken;
 
 /*
@@ -32,6 +33,7 @@ Route::group(['middleware' => 'basicauth'], function () {
     });
     Route::get('login', [LoginController::class, 'create'])->name('user.login');
     Route::post('login', [LoginController::class, 'store']);
+    Route::get('mcp-chat', [McpChatController::class, 'index'])->name('web.mcp.chat');
 
 
     //管理画面側

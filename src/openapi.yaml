@@ -5,6 +5,34 @@ info:
 servers:
   - url: http://localhost:8081
 paths:
+  /api/mcp-chat:
+    post:
+      summary: Chat with MCP orchestrator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                messages:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/ChatMessage'
+              required: [messages]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatResponse'
+        '422':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
   /api/tv-options:
     get:
       summary: List TV options
@@ -326,3 +354,37 @@ components:
         errors:
           type: object
       required: [message, errors]
+    ChatMessage:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant]
+        content:
+          type: string
+      required: [role, content]
+    ChatToolCall:
+      type: object
+      properties:
+        name:
+          type: string
+        arguments:
+          type: object
+        result:
+          type: object
+      required: [name, arguments, result]
+    ChatResponse:
+      type: object
+      properties:
+        message:
+          type: object
+          properties:
+            role:
+              type: string
+            content:
+              type: string
+          required: [role, content]
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatToolCall'

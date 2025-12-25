@@ -4,6 +4,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\Api\TvController;
 use App\Http\Controllers\Api\TvOptionController;
+use App\Http\Controllers\Api\McpChatController;
 
 /*
 |--------------------------------------------------------------------------
@@ -25,6 +26,8 @@ Route::get('/openapi.yaml', function () {
         'Content-Type' => 'application/yaml',
     ]);
 });
+
+Route::post('/mcp-chat', [McpChatController::class, 'chat']);
 
 Route::get('/tv-options', [TvOptionController::class, 'index']);
 Route::get('/tv-options/{tvOption}', [TvOptionController::class, 'show']);
