@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
@@ -66,7 +67,16 @@ class McpChatController extends Controller
             ],
         ];
 
-        $firstResponse = $this->callOpenAi($openaiKey, $model, $messages, $toolDefinitions);
+        try {
+            $firstResponse = $this->callOpenAi($openaiKey, $model, $messages, $toolDefinitions);
+        } catch (RequestException $exception) {
+            return $this->openAiErrorResponse($exception);
+        } catch (\Throwable $exception) {
+            return response()->json([
+                'error' => 'OpenAI request failed.',
+                'details' => $exception->getMessage(),
+            ], 500);
+        }
         $firstMessage = $firstResponse['choices'][0]['message'] ?? [];
 
         $toolCalls = $firstMessage['tool_calls'] ?? [];
@@ -108,7 +118,17 @@ class McpChatController extends Controller
             ];
         }
 
-        $finalResponse = $this->callOpenAi($openaiKey, $model, $messages, $toolDefinitions, 'none');
+        try {
+            $finalResponse = $this->callOpenAi($openaiKey, $model, $messages, $toolDefinitions, 'none');
+        } catch (RequestException $exception) {
+            return $this->openAiErrorResponse($exception, $toolResults);
+        } catch (\Throwable $exception) {
+            return response()->json([
+                'error' => 'OpenAI request failed.',
+                'details' => $exception->getMessage(),
+                'tool_calls' => $toolResults,
+            ], 500);
+        }
         $finalMessage = $finalResponse['choices'][0]['message'] ?? [];
 
         return response()->json([
@@ -130,7 +150,6 @@ class McpChatController extends Controller
                 'messages' => $messages,
                 'tools' => $tools,
                 'tool_choice' => $toolChoice,
-                'temperature' => 0.3,
             ])
             ->throw();
 
@@ -168,5 +187,18 @@ class McpChatController extends Controller
                 'error' => $exception->getMessage(),
             ];
         }
+    }
+
+    private function openAiErrorResponse(RequestException $exception, array $toolResults = []): JsonResponse
+    {
+        $response = $exception->response;
+        $status = $response?->status() ?? 502;
+        $details = $response?->json() ?? $exception->getMessage();
+
+        return response()->json([
+            'error' => 'OpenAI request failed.',
+            'details' => $details,
+            'tool_calls' => $toolResults,
+        ], $status);
     }
 }
